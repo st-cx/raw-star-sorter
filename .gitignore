@@ -1,0 +1,42 @@
+# Local dependencies and environments
+toolkit/tools/exiftool/
+toolkit/exiftool.exe
+toolkit/exiftool_files/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Photo batches, generated results, archives and local binaries
+matched_*/
+unmatched_*/
+*.nef
+*.NEF
+*.jpg
+*.JPG
+*.jpeg
+*.JPEG
+*.xmp
+*.XMP
+*.arw
+*.ARW
+*.cr2
+*.CR2
+*.cr3
+*.CR3
+*.dng
+*.DNG
+*.csv
+*.log
+*.zip
+*.exe
+*.dll
+*_original
+*.tmp
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
