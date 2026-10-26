@@ -33,6 +33,8 @@ unmatched_*/
 *.dll
 *_original
 *.tmp
+.raw-star-sorter/
+.raw-star-export-*/
 
 # Editors and operating systems
 .idea/

@@ -27,11 +27,18 @@ param(
     [switch]$KeepMissingTags,
     [switch]$SkipSidecars,
     [switch]$RatingFromFolder,
+    [hashtable]$RatingOverrides,
     [switch]$PassThru
 )
 $ErrorActionPreference = 'Stop'
 if (-not $PSBoundParameters.ContainsKey('Path')) { $Path = $PSScriptRoot }
 $timer = [Diagnostics.Stopwatch]::StartNew()
+if ($PSBoundParameters.ContainsKey('RatingOverrides')) {
+    if ($RatingFromFolder) { throw '不能同时使用文件夹星级和已读取的照片星级。' }
+    foreach ($value in $RatingOverrides.Values) {
+        if ([string]$value -notmatch '^[0-5]$') { throw '指定星级必须是 0-5 的整数。' }
+    }
+}
 function Convert-Extension([string]$Value) {
     $value = $Value.Trim().TrimStart('.').ToLowerInvariant()
     if ($value -notmatch '^[a-z0-9]+$') { throw "无效扩展名：$Value" }
@@ -69,7 +76,7 @@ foreach ($star in $StarFolders) {
     if (-not [IO.Directory]::Exists($starPath)) { continue }
     $localSidecars = @{}
     $localRaw = [Collections.Generic.List[object]]::new()
-    foreach ($file in Get-ChildItem -LiteralPath $starPath -File) {
+    foreach ($file in Get-ChildItem -LiteralPath $starPath -File -Force) {
         $extension = $file.Extension.TrimStart('.').ToLowerInvariant()
         if ($extension -eq $rawExt) { $localRaw.Add($file) }
         elseif ($extension -eq 'xmp') { $localSidecars[$file.BaseName] = $file.FullName }
@@ -95,6 +102,7 @@ $results = [Collections.Generic.List[object]]::new()
 $missing = 0
 $duplicates = 0
 foreach ($base in $jpgByBase.Keys) {
+    if ($PSBoundParameters.ContainsKey('RatingOverrides') -and -not $RatingOverrides.ContainsKey($base)) { continue }
     $jpg = $jpgByBase[$base]
     if (-not $rawByBase.ContainsKey($base)) {
         if ($base -match '^(.*)__dup\d+$' -and $jpgByBase.ContainsKey($Matches[1])) { $duplicates++ }
@@ -158,11 +166,16 @@ elseif ($pairs.Count) {
             $writer = $null
             try {
                 $originalTimes = @{}
+                $originalAttributes = @{}
                 $writer = [IO.StreamWriter]::new($argumentFile, $false, [Text.UTF8Encoding]::new($false))
                 for ($index = $offset; $index -lt $offset + $count; $index++) {
                     $pair = $pairs[$index]
                     $originalTimes[$pair.Raw] = [IO.File]::GetLastWriteTimeUtc($pair.Raw)
-                    if ($pair.Sidecar) { $originalTimes[$pair.Sidecar] = [IO.File]::GetLastWriteTimeUtc($pair.Sidecar) }
+                    $originalAttributes[$pair.Raw] = [IO.File]::GetAttributes($pair.Raw)
+                    if ($pair.Sidecar) {
+                        $originalTimes[$pair.Sidecar] = [IO.File]::GetLastWriteTimeUtc($pair.Sidecar)
+                        $originalAttributes[$pair.Sidecar] = [IO.File]::GetAttributes($pair.Sidecar)
+                    }
                     $writer.WriteLine('-charset')
                     $writer.WriteLine('filename=UTF8')
                     $writer.WriteLine('-P')
@@ -177,9 +190,10 @@ elseif ($pairs.Count) {
                         $writer.WriteLine('-xmp:Rating<IFD0:Rating')
                     }
                     foreach ($tag in $tags) { $writer.WriteLine('-' + $tag) }
-                    if ($RatingFromFolder) {
-                        $writer.WriteLine('-xmp:Rating=' + $pair.Star)
-                        $percent = @(0, 1, 25, 50, 75, 99)[[int]$pair.Star]
+                    if ($RatingFromFolder -or $PSBoundParameters.ContainsKey('RatingOverrides')) {
+                        $effectiveRating = if ($RatingFromFolder) { [int]$pair.Star } else { [int]$RatingOverrides[[IO.Path]::GetFileNameWithoutExtension($pair.Jpg)] }
+                        $writer.WriteLine('-xmp:Rating=' + $effectiveRating)
+                        $percent = @(0, 1, 25, 50, 75, 99)[$effectiveRating]
                         $writer.WriteLine('-xmp:RatingPercent=' + $percent)
                     }
                     $writer.WriteLine($pair.Raw)
@@ -197,7 +211,13 @@ elseif ($pairs.Count) {
                     $output = @(& $tool -charset filename=UTF8 -@ $argumentFile 2>&1)
                     $exitCode = $LASTEXITCODE
                 }
-                finally { $ErrorActionPreference = $nativePreference }
+                finally {
+                    $ErrorActionPreference = $nativePreference
+                    # ExifTool 替换文件时会丢失隐藏属性；包括部分失败时已写入的文件也要恢复。
+                    foreach ($target in $originalAttributes.Keys) {
+                        [IO.File]::SetAttributes($target, $originalAttributes[$target])
+                    }
+                }
                 $errorPaths = @{}
                 foreach ($line in [IO.File]::ReadAllLines($errorFile, [Text.Encoding]::UTF8)) {
                     # ExifTool 在 Windows 上也可能返回 /，统一为绝对路径再比较。

@@ -20,10 +20,15 @@ param(
     [string]$RawSourceDir = 'matched_nef',
     [string]$JpgSourceDir = 'matched_jpg',
     [string]$ExifToolPath = '',
+    [ValidateSet('Zero', 'Skip')][string]$UnratedAction = 'Zero',
+    [string]$ReportPath = '',
+    [switch]$SyncTags,
+    [switch]$PlanOnly,
     [switch]$DryRun,
     [switch]$PassThru
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'workflow-common.ps1')
 if (-not $PSBoundParameters.ContainsKey('Path')) { $Path = $PSScriptRoot }
 $timer = [Diagnostics.Stopwatch]::StartNew()
 function Convert-Extension([string]$Value) {
@@ -38,9 +43,10 @@ function Get-ChildDirectory([string]$Value) {
         throw "文件夹必须位于照片目录内：$Value"
     }
     if ([IO.File]::Exists($candidate)) { throw "文件夹位置被文件占用：$candidate" }
-    return $candidate
+    return (Assert-LocalPath $root $candidate)
 }
 function Add-IndexedFile($Index, $File) {
+    $null = Assert-LocalPath $root $File.FullName
     if ($Index.ContainsKey($File.BaseName)) {
         throw "同名文件无法确定匹配，未移动任何文件：$($Index[$File.BaseName].FullName)、$($File.FullName)"
     }
@@ -143,8 +149,12 @@ function Invoke-MoveGroup($Operations) {
                 [IO.Directory]::CreateDirectory($directory) | Out-Null
                 $readyDirectories[$directory] = $true
             }
+            $source = Get-Item -LiteralPath $operation.From -Force
+            $script:moveId++
+            Write-HistoryEvent $history.Writer @{ Type = 'Move'; Id = $script:moveId; From = $operation.From; To = $operation.To; Length = $source.Length; ModifiedTicks = $source.LastWriteTimeUtc.Ticks }
             [IO.File]::Move($operation.From, $operation.To)
             $finished.Add($operation)
+            Write-HistoryEvent $history.Writer @{ Type = 'Moved'; Id = $script:moveId }
             Write-Verbose ("{0} -> {1}" -f $operation.From, $operation.To)
         }
     }
@@ -161,6 +171,9 @@ function Invoke-MoveGroup($Operations) {
 $rawExt = Convert-Extension $RawExt
 $pickExt = Convert-Extension $PickExt
 $sidecarExt = if ($SidecarExt) { Convert-Extension $SidecarExt } else { '' }
+if ($SyncTags -and $sidecarExt -and $sidecarExt -ne 'xmp') {
+    throw '-SyncTags 仅支持 -SidecarExt xmp 或空字符串；未移动任何文件。'
+}
 $pickExtensions = if ($pickExt -in @('jpg', 'jpeg')) { @('jpg', 'jpeg') } else { @($pickExt) }
 if ($rawExt -in $pickExtensions -or ($sidecarExt -and ($sidecarExt -eq $rawExt -or $sidecarExt -in $pickExtensions))) {
     throw 'RAW、JPG 和 XMP 的扩展名必须不同。'
@@ -197,9 +210,9 @@ foreach ($directory in $rawDirectories) {
     }
 }
 if ($sidecarExt -and $rawSource -ne $root) {
-    foreach ($file in Get-ChildItem -LiteralPath $root -File) {
+    foreach ($file in Get-ChildItem -LiteralPath $root -File -Force) {
         if ($file.Extension.TrimStart('.') -eq $sidecarExt -and -not $sidecarByBase.ContainsKey($file.BaseName)) {
-            $sidecarByBase[$file.BaseName] = $file
+            Add-IndexedFile $sidecarByBase $file
         }
     }
 }
@@ -209,6 +222,7 @@ Write-Host '请先在 Adobe 软件中将星级保存到 JPG 元数据；JPG 留�
 $jpgFiles = @($jpgByBase.Values | Sort-Object Name)
 $ratings = Read-JpgRatings $jpgFiles
 $groups = [Collections.Generic.List[object]]::new()
+$items = [Collections.Generic.List[object]]::new()
 $operations = [Collections.Generic.List[object]]::new()
 $missing = [Collections.Generic.List[string]]::new()
 $rejected = [Collections.Generic.List[string]]::new()
@@ -217,11 +231,22 @@ $reserved = @{}
 $starCounts = @(0, 0, 0, 0, 0, 0)
 $alreadySorted = 0
 $sidecarCount = 0
+$unrated = 0
+$explicitZero = 0
 foreach ($jpg in $jpgFiles) {
     $rating = $ratings[$jpg.FullName].Rating
-    if ($rating -eq -1) { $rejected.Add($jpg.FullName); continue }
+    $source = $ratings[$jpg.FullName].Source
+    $raw = if ($rawByBase.ContainsKey($jpg.BaseName)) { $rawByBase[$jpg.BaseName].FullName } else { '' }
+    $sidecar = if ($sidecarByBase.ContainsKey($jpg.BaseName)) { $sidecarByBase[$jpg.BaseName].FullName } else { '' }
+    $item = [pscustomobject]@{ BaseName = $jpg.BaseName; Jpg = $jpg.FullName; Raw = $raw; Sidecar = $sidecar; Rating = $rating; RatingSource = $source; Status = 'Planned'; TargetDirectory = '' }
+    $items.Add($item)
+    if ($source -eq '未评分') { $unrated++ }
+    elseif ($rating -eq 0) { $explicitZero++ }
+    if ($rating -eq -1) { $rejected.Add($jpg.FullName); $item.Status = 'Rejected'; continue }
+    if ($source -eq '未评分' -and $UnratedAction -eq 'Skip') { $item.Status = 'UnratedSkipped'; continue }
     $starCounts[$rating]++
-    if (-not $rawByBase.ContainsKey($jpg.BaseName)) { $missing.Add($jpg.FullName); continue }
+    if (-not $rawByBase.ContainsKey($jpg.BaseName)) { $missing.Add($jpg.FullName); $item.Status = 'MissingRaw'; continue }
+    $item.TargetDirectory = $starPaths[$rating]
     $group = [Collections.Generic.List[object]]::new()
     Add-Move $group $rawByBase[$jpg.BaseName] $starPaths[$rating]
     if ($sidecarExt -and $sidecarByBase.ContainsKey($jpg.BaseName)) {
@@ -230,16 +255,23 @@ foreach ($jpg in $jpgFiles) {
         if ($group.Count -gt $before) { $sidecarCount++ }
     }
     if ($group.Count) { $groups.Add([pscustomobject]@{ Jpg = $jpg; Rating = $rating; Moves = $group }) }
-    else { $alreadySorted++ }
+    else { $alreadySorted++; $item.Status = 'AlreadySorted' }
 }
 if ($conflicts.Count) { throw ("存在同名目标，未移动任何文件。请先处理：`n" + ($conflicts -join "`n")) }
 Write-Host "JPG/JPEG：$($jpgFiles.Count)；待归类：$($groups.Count)；已在正确星级：$alreadySorted；待移动 XMP：$sidecarCount"
 Write-Host ((0..5 | ForEach-Object { "$_ 星：$($starCounts[$_])" }) -join '；')
-Write-Host "未评分按 0 星；拒绝标记跳过：$($rejected.Count)；缺 RAW 跳过：$($missing.Count)"
+Write-Host "未保存星级：$unrated（处理策略：$UnratedAction）；明确 0 星：$explicitZero；拒绝跳过：$($rejected.Count)；缺 RAW：$($missing.Count)"
+if ($unrated -eq $jpgFiles.Count -and $unrated) { Write-Warning '所有 JPG 都没有星级标签。如果已在 Lightroom 打星，请先将元数据保存到文件，再重新预览。' }
 foreach ($file in $missing) { Write-Warning "没有同名 RAW，跳过：$file" }
 foreach ($file in $rejected) { Write-Verbose "拒绝标记 (-1)，保留当前位置：$file" }
+if ($ReportPath) { Export-PlanCsv $items $ReportPath }
+if ($PlanOnly) {
+    [pscustomobject]@{ Root = $root; Items = @($items.ToArray()); Groups = @($groups.ToArray()); Unrated = $unrated; ExplicitZero = $explicitZero }
+    return
+}
 if ($DryRun) {
     Write-Host '预览模式：只读星级，不创建文件夹、不移动文件、不修改标签。' -ForegroundColor Magenta
+    if ($SyncTags) { Write-Host '执行时还会同步有效匹配照片的星级与标签，保留目标缺失字段及 _original 副本；拒绝/跳过的照片不参与同步。' }
     for ($index = 0; $index -lt $groups.Count; $index++) {
         $group = $groups[$index]
         $description = "$($group.Jpg.Name) [$($group.Rating) 星]"
@@ -251,8 +283,14 @@ if ($DryRun) {
 $completed = 0
 $filesMoved = 0
 $readyDirectories = @{}
+$history = $null
+$workflowLock = $null
+$script:moveId = 0
+$syncResult = $null
 if (-not $DryRun) {
     try {
+        if ($groups.Count -or $SyncTags) { $workflowLock = Open-WorkflowLock $root }
+        if ($groups.Count) { $history = New-MoveHistory $root }
         foreach ($group in $groups) {
             Invoke-MoveGroup $group.Moves
             $completed++
@@ -261,8 +299,22 @@ if (-not $DryRun) {
                 Write-Progress -Activity '按照片星级自动归类' -Status "$completed / $($groups.Count)" -PercentComplete (100 * $completed / $groups.Count)
             }
         }
+        if ($history) { Write-HistoryEvent $history.Writer @{ Type = 'Finished'; Photos = $completed } }
+        if ($SyncTags) {
+            $ratingOverrides = @{}
+            foreach ($item in $items) {
+                if ($item.Status -in @('Planned', 'AlreadySorted')) { $ratingOverrides[$item.BaseName] = $item.Rating }
+            }
+            if ($ratingOverrides.Count) {
+                $syncResult = & (Join-Path $PSScriptRoot 'sync-tags-to-nef.ps1') -Path $root -RawExt $RawExt -PickExt $PickExt -JpgSourceDir $JpgSourceDir -ExifToolPath $ExifToolPath -RatingOverrides $ratingOverrides -KeepMissingTags -KeepBackup -SkipSidecars:([string]::IsNullOrEmpty($sidecarExt)) -PassThru
+            }
+        }
     }
-    finally { Write-Progress -Activity '按照片星级自动归类' -Completed }
+    finally {
+        if ($history) { $history.Writer.Dispose(); Write-Host "可撤销记录：$($history.Path)" }
+        if ($workflowLock) { $workflowLock.Dispose() }
+        Write-Progress -Activity '按照片星级自动归类' -Completed
+    }
     Write-Host ("完成：归类 {0} 张，移动 {1} 个 RAW/XMP 文件；耗时 {2:N2} 秒。" -f $completed, $filesMoved, $timer.Elapsed.TotalSeconds) -ForegroundColor Green
 }
 if ($PassThru) {
@@ -270,6 +322,8 @@ if ($PassThru) {
         PickFilesSeen = $jpgFiles.Count; Planned = $groups.Count; MovedPhotos = $completed
         FilesMoved = $filesMoved; Sidecars = $sidecarCount; AlreadySorted = $alreadySorted
         RawMissing = $missing.Count; Rejected = $rejected.Count; DryRun = [bool]$DryRun
+        Unrated = $unrated; ExplicitZero = $explicitZero; UnratedAction = $UnratedAction
+        HistoryPath = if ($history) { $history.Path } else { '' }; Sync = $syncResult
         ElapsedSeconds = $timer.Elapsed.TotalSeconds
     }
 }
